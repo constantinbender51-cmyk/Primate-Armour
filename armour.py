@@ -12,8 +12,8 @@ API_SECRET = os.getenv("KRAKEN_FUTURES_SECRET", "YOUR_API_SECRET")
 STOP_LOSS_PCT = 0.015  # 1.5%
 TAKE_PROFIT_PCT = 0.05 # 5.0%
 
-# List of symbols to IGNORE (Case-sensitive, usually uppercase)
-EXCLUDED_SYMBOLS = ["PF_XBTUSD"] 
+# Symbols to completely ignore (e.g. ['PF_XBTUSD'])
+EXCLUDED_SYMBOLS = ["PF_XBTUSD"]
 
 # Setup Logging
 logging.basicConfig(
@@ -27,30 +27,19 @@ logger = logging.getLogger()
 INSTRUMENT_SPECS = {}
 
 def get_decimals_from_tick(tick_val):
-    """
-    Calculates decimal places from tick size, handling Scientific Notation (1e-05).
-    """
     try:
         d = Decimal(str(tick_val)).normalize()
         exponent = d.as_tuple().exponent
         return abs(exponent) if exponent < 0 else 0
-    except Exception as e:
-        logger.error(f"Error calculating decimals for tick {tick_val}: {e}")
+    except:
         return 2
 
 def update_instrument_specs(api: KrakenFuturesApi):
-    """
-    Fetches instruments. Returns False if failed.
-    """
     logger.info("Fetching instrument specifications...")
     try:
         resp = api.get_instruments()
-        
-        if 'instruments' not in resp:
-            logger.error(f"API Response missing 'instruments' key.")
-            return False
-
         instruments = resp.get('instruments', [])
+        
         if not instruments:
             logger.error("API returned EMPTY instrument list.")
             return False
@@ -60,29 +49,22 @@ def update_instrument_specs(api: KrakenFuturesApi):
             symbol = inst.get('symbol')
             if not symbol: continue
 
-            # Validation: We MUST have these values
             raw_tick = inst.get('tickSize')
             raw_prec = inst.get('contractValueTradePrecision')
             
-            if raw_tick is None or raw_prec is None:
-                continue
-
-            tick_size = float(raw_tick)
-            qty_prec = int(raw_prec)
-            price_decimals = get_decimals_from_tick(tick_size)
+            if raw_tick is None or raw_prec is None: continue
 
             INSTRUMENT_SPECS[symbol] = {
-                'tick_size': tick_size,
-                'price_decimals': price_decimals,
-                'qty_precision': qty_prec
+                'tick_size': float(raw_tick),
+                'price_decimals': get_decimals_from_tick(raw_tick),
+                'qty_precision': int(raw_prec)
             }
             count += 1
             
-        logger.info(f"Successfully loaded specs for {count} instruments.")
+        logger.info(f"Loaded specs for {count} instruments.")
         return True
-
     except Exception as e:
-        logger.error(f"CRITICAL: Failed to load instruments: {e}")
+        logger.error(f"Failed to load instruments: {e}")
         return False
 
 def format_price(price, symbol):
@@ -92,16 +74,12 @@ def format_price(price, symbol):
     tick = specs['tick_size']
     decimals = specs['price_decimals']
 
-    # Round to nearest tick
     rounded = round(price / tick) * tick
-    
-    # Format string to specific decimal places
     fmt_str = f"{rounded:.{decimals}f}"
     
-    # Return correct type (int vs float)
-    final_val = float(fmt_str) if decimals > 0 else int(float(fmt_str))
-    
-    return final_val, True
+    # Return valid JSON number (int if 0 decimals, else float)
+    val = float(fmt_str) if decimals > 0 else int(float(fmt_str))
+    return val, True
 
 def format_qty(qty, symbol):
     specs = INSTRUMENT_SPECS.get(symbol)
@@ -109,8 +87,8 @@ def format_qty(qty, symbol):
     
     prec = specs['qty_precision']
     fmt_str = f"{qty:.{prec}f}"
-    final_val = float(fmt_str) if prec > 0 else int(float(fmt_str))
-    return final_val, True
+    val = float(fmt_str) if prec > 0 else int(float(fmt_str))
+    return val, True
 
 def place_order_safe(api, payload):
     symbol = payload.get('symbol')
@@ -122,12 +100,13 @@ def place_order_safe(api, payload):
         else:
             logger.info(f"[{symbol}] Success: {resp.get('sendStatus')}")
     except Exception as e:
-        logger.error(f"[{symbol}] EXCEPTION sending order: {e}")
+        logger.error(f"[{symbol}] EXCEPTION: {e}")
 
 def monitor_and_manage_risk(api: KrakenFuturesApi):
     logger.info("Scanning positions...")
 
     try:
+        # 1. Fetch Data
         pos_resp = api.get_open_positions()
         ord_resp = api.get_open_orders()
         
@@ -138,29 +117,26 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
             logger.info("No open positions.")
             return
 
+        # 2. Iterate Positions
         for pos in positions:
-            symbol = pos['symbol']
+            symbol = pos['symbol'] # e.g. "PF_ADAUSD"
             
-            # --- 1. EXCLUSION CHECK ---
-            if symbol in EXCLUDED_SYMBOLS:
-                # Log only once per loop to avoid spamming if you prefer
-                # logger.info(f"[{symbol}] Skipping (Excluded).")
-                continue
-            
-            # --- 2. VALIDATION GATE ---
-            if symbol not in INSTRUMENT_SPECS:
-                logger.warning(f"[{symbol}] MISSING SPECS. Skipping.")
+            # --- Exclusion Check ---
+            # Compare upper case to be safe
+            if symbol.upper() in [x.upper() for x in EXCLUDED_SYMBOLS]:
+                # logger.info(f"[{symbol}] Skipping (Excluded)")
                 continue
 
-            side = pos['side'].lower()
+            if symbol not in INSTRUMENT_SPECS:
+                logger.warning(f"[{symbol}] Specs missing. Skipping.")
+                continue
+
+            # Position Details
+            side = pos['side'].lower() # 'long'/'short' or 'buy'/'sell'
             entry_price = float(pos['price'])
             raw_size = float(pos['size'])
             
-            # Format Quantity
-            size, q_ok = format_qty(raw_size, symbol)
-            if not q_ok: continue
-
-            # Calculate Targets
+            # Determine Action Side (Close position)
             if side in ['long', 'buy']:
                 action_side = 'sell'
                 raw_stp = entry_price * (1 - STOP_LOSS_PCT)
@@ -170,27 +146,47 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
                 raw_stp = entry_price * (1 + STOP_LOSS_PCT)
                 raw_lmt = entry_price * (1 - TAKE_PROFIT_PCT)
 
-            # Format Prices
+            # Format Values
+            size, q_ok = format_qty(raw_size, symbol)
             target_stp, s_ok = format_price(raw_stp, symbol)
             target_lmt, l_ok = format_price(raw_lmt, symbol)
 
-            if not s_ok or not l_ok:
-                logger.error(f"[{symbol}] Failed to format prices.")
+            if not (q_ok and s_ok and l_ok):
+                logger.error(f"[{symbol}] Formatting failed.")
                 continue
 
-            # Identify Existing Orders
+            # --- CRITICAL FIX: MATCH EXISTING ORDERS ---
             existing_stp = None
             existing_lmt = None
 
             for order in open_orders:
-                if order['symbol'] == symbol and order['side'] == action_side:
-                    o_type = order['orderType'].lower()
-                    if o_type == 'stp': existing_stp = order
-                    elif o_type == 'lmt': existing_lmt = order
+                # 1. Normalize Symbol (Handle case mismatch)
+                o_symbol = order['symbol']
+                if o_symbol.lower() != symbol.lower():
+                    continue
 
-            # EXECUTE STOP LOSS
+                # 2. Normalize Side
+                o_side = order['side'].lower()
+                if o_side != action_side:
+                    continue
+                
+                # 3. Normalize Type (Handle 'stp' vs 'stop')
+                o_type = order['orderType'].lower()
+                
+                # Check for Stop Loss
+                if o_type in ['stp', 'stop']:
+                    existing_stp = order
+                
+                # Check for Take Profit
+                elif o_type in ['lmt', 'limit']:
+                    existing_lmt = order
+
+            # --- EXECUTION LOGIC ---
+            
+            # 1. STOP LOSS
             if not existing_stp:
-                payload = {
+                logger.info(f"[{symbol}] No STP found. Placing new one...")
+                place_order_safe(api, {
                     "orderType": "stp",
                     "symbol": symbol,
                     "side": action_side,
@@ -198,35 +194,35 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
                     "stopPrice": target_stp,
                     "reduceOnly": True,
                     "triggerSignal": "mark"
-                }
-                place_order_safe(api, payload)
+                })
             else:
+                # Check if update needed
                 curr_stp = float(existing_stp.get('stopPrice', 0))
                 tick = INSTRUMENT_SPECS[symbol]['tick_size']
                 if abs(curr_stp - target_stp) > (tick * 2):
-                    logger.info(f"[{symbol}] Update STP: {curr_stp} -> {target_stp}")
+                    logger.info(f"[{symbol}] STP deviation detected ({curr_stp} vs {target_stp}). Updating...")
                     api.edit_order({
                         "orderId": existing_stp['order_id'],
                         "stopPrice": target_stp,
                         "size": size 
                     })
 
-            # EXECUTE TAKE PROFIT
+            # 2. TAKE PROFIT
             if not existing_lmt:
-                payload = {
+                logger.info(f"[{symbol}] No LMT found. Placing new one...")
+                place_order_safe(api, {
                     "orderType": "lmt",
                     "symbol": symbol,
                     "side": action_side,
                     "size": size,
                     "limitPrice": target_lmt,
                     "reduceOnly": True
-                }
-                place_order_safe(api, payload)
+                })
             else:
                 curr_lmt = float(existing_lmt.get('limitPrice', 0))
                 tick = INSTRUMENT_SPECS[symbol]['tick_size']
                 if abs(curr_lmt - target_lmt) > (tick * 2):
-                    logger.info(f"[{symbol}] Update LMT: {curr_lmt} -> {target_lmt}")
+                    logger.info(f"[{symbol}] LMT deviation detected ({curr_lmt} vs {target_lmt}). Updating...")
                     api.edit_order({
                         "orderId": existing_lmt['order_id'],
                         "limitPrice": target_lmt,
@@ -243,12 +239,10 @@ if __name__ == "__main__":
 
     api = KrakenFuturesApi(API_KEY, API_SECRET)
     
-    success = update_instrument_specs(api)
-    if not success:
-        logger.critical("Failed to acquire instrument specs. Exiting.")
+    if not update_instrument_specs(api):
         exit(1)
 
-    logger.info(f"--- Risk Manager Running (Excluding: {EXCLUDED_SYMBOLS}) ---")
+    logger.info(f"--- Running Risk Manager (Excluded: {EXCLUDED_SYMBOLS}) ---")
     while True:
         monitor_and_manage_risk(api)
         time.sleep(60)
