@@ -12,10 +12,10 @@ API_SECRET = os.getenv("KRAKEN_FUTURES_SECRET", "YOUR_API_SECRET")
 STOP_LOSS_PCT = 0.015  # 1.5%
 TAKE_PROFIT_PCT = 0.05 # 5.0%
 
+# Symbols to ignore completely (no new orders, no cancels)
 EXCLUDED_SYMBOLS = ["PF_XBTUSD"]
 
 # --- LOGGING SETUP ---
-# We set this to INFO, but the messages are now much more detailed
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
@@ -95,16 +95,18 @@ def place_order_safe(api, payload, action_type="CREATE"):
     try:
         if action_type == "EDIT":
             resp = api.edit_order(payload)
+        elif action_type == "CANCEL":
+            resp = api.cancel_order(payload)
         else:
             resp = api.send_order(payload)
 
         # Kraken Futures specific error checking
-        if resp.get('result') == 'error':
-            logger.error(f"[{symbol}] !!! API ERROR: {resp}")
-        elif 'error' in resp: # Some endpoints use this key
+        if isinstance(resp, dict) and (resp.get('result') == 'error' or 'error' in resp):
              logger.error(f"[{symbol}] !!! API ERROR: {resp}")
         else:
-            status = resp.get('sendStatus') or resp.get('status') or "OK"
+            status = "OK"
+            if isinstance(resp, dict):
+                status = resp.get('sendStatus') or resp.get('status') or "OK"
             logger.info(f"[{symbol}] <<< SUCCESS: {status}")
             
     except Exception as e:
@@ -129,9 +131,9 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
             return 
 
         positions = pos_resp.get("openPositions", [])
-        open_orders = ord_resp.get("openOrders", [])
+        all_open_orders = ord_resp.get("openOrders", [])
 
-        logger.info(f"Fetched: {len(positions)} Positions | {len(open_orders)} Open Orders")
+        logger.info(f"Fetched: {len(positions)} Positions | {len(all_open_orders)} Open Orders")
 
         if not positions:
             logger.info("No open positions to manage.")
@@ -174,38 +176,53 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
                 logger.error(f"[{symbol}] Formatting Failed. Tick/Prec data likely corrupted.")
                 continue
             
-            # Log the Math
             logger.info(f"[{symbol}] Position: {side.upper()} @ {entry_price} | Size: {size}")
-            logger.info(f"[{symbol}] Targets : STP {target_stp} ({STOP_LOSS_PCT*100}%) | LMT {target_lmt} ({TAKE_PROFIT_PCT*100}%)")
+            logger.info(f"[{symbol}] Targets : STP {target_stp} | LMT {target_lmt}")
 
             # --- MATCHING EXISTING ORDERS ---
-            existing_stp = None
-            existing_lmt = None
-            
-            # Debug: See what we are comparing against
-            matched_orders_count = 0
+            # We filter for orders strictly related to this position (Symbol + ReduceOnly/Exit Side)
+            position_orders = [
+                o for o in all_open_orders 
+                if o['symbol'] == symbol and o['side'].lower() == action_side
+            ]
 
-            for order in open_orders:
-                if order['symbol'].lower() != symbol.lower(): continue
-                if order['side'].lower() != action_side: continue
-                
-                matched_orders_count += 1
+            existing_stp_orders = []
+            existing_lmt_orders = []
+
+            for order in position_orders:
                 o_type = order['orderType'].lower()
-                o_id = order.get('order_id') or order.get('orderId')
-                o_price = order.get('stopPrice') or order.get('limitPrice')
-
+                # Categorize
                 if o_type in ['stp', 'stop']:
-                    existing_stp = order
-                    logger.info(f"[{symbol}] Found EXISTING STP: ID={o_id}, Price={o_price}")
+                    existing_stp_orders.append(order)
                 elif o_type in ['lmt', 'limit']:
-                    existing_lmt = order
-                    logger.info(f"[{symbol}] Found EXISTING LMT: ID={o_id}, Price={o_price}")
+                    existing_lmt_orders.append(order)
 
-            if matched_orders_count == 0:
-                logger.info(f"[{symbol}] No existing orders found matching side {action_side}.")
+            # --- SELECTION LOGIC ---
+            # We want to keep exactly ONE best order for STP and ONE for LMT.
+            # If multiple exist, we pick the one closest to our target (to minimize edits) or just the first one.
+            # Then we cancel the rest.
+
+            # Helper to select best order (currently just picks first, but you can add logic to pick closest price)
+            chosen_stp = existing_stp_orders[0] if existing_stp_orders else None
+            chosen_lmt = existing_lmt_orders[0] if existing_lmt_orders else None
+
+            orders_to_keep_ids = []
+            if chosen_stp: orders_to_keep_ids.append(chosen_stp.get('order_id') or chosen_stp.get('orderId'))
+            if chosen_lmt: orders_to_keep_ids.append(chosen_lmt.get('order_id') or chosen_lmt.get('orderId'))
+
+            # --- CLEANUP: Cancel Extra Orders ---
+            # Iterate through ALL orders for this symbol/side and cancel if not in "keep" list
+            for order in position_orders:
+                o_id = order.get('order_id') or order.get('orderId')
+                if o_id not in orders_to_keep_ids:
+                    logger.info(f"[{symbol}] Action: CANCEL EXTRA ORDER {o_id} (Type: {order.get('orderType')})")
+                    place_order_safe(api, {
+                        "orderId": o_id,
+                        "symbol": symbol
+                    }, "CANCEL")
 
             # --- EXECUTION: STOP LOSS ---
-            if not existing_stp:
+            if not chosen_stp:
                 logger.info(f"[{symbol}] Action: CREATE STP")
                 place_order_safe(api, {
                     "orderType": "stp",
@@ -217,23 +234,21 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
                     "triggerSignal": "mark"
                 }, "CREATE")
             else:
-                curr_stp = float(existing_stp.get('stopPrice', 0))
+                curr_stp = float(chosen_stp.get('stopPrice', 0))
                 tick = INSTRUMENT_SPECS[symbol]['tick_size']
                 diff = abs(curr_stp - target_stp)
-                threshold = tick * 2
+                threshold = tick * 2 # Only edit if diff is > 2 ticks to save API calls
                 
                 if diff > threshold:
-                    logger.info(f"[{symbol}] Action: UPDATE STP | Current: {curr_stp} | Target: {target_stp} | Diff: {diff:.6f} > {threshold}")
+                    logger.info(f"[{symbol}] Action: UPDATE STP | Current: {curr_stp} | Target: {target_stp}")
                     place_order_safe(api, {
-                        "orderId": existing_stp.get('order_id') or existing_stp.get('orderId'),
+                        "orderId": chosen_stp.get('order_id') or chosen_stp.get('orderId'),
                         "stopPrice": target_stp,
                         "size": size 
                     }, "EDIT")
-                else:
-                    logger.info(f"[{symbol}] STP OK (Diff {diff:.6f} within threshold)")
 
             # --- EXECUTION: TAKE PROFIT ---
-            if not existing_lmt:
+            if not chosen_lmt:
                 logger.info(f"[{symbol}] Action: CREATE LMT")
                 place_order_safe(api, {
                     "orderType": "lmt",
@@ -244,20 +259,18 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
                     "reduceOnly": True
                 }, "CREATE")
             else:
-                curr_lmt = float(existing_lmt.get('limitPrice', 0))
+                curr_lmt = float(chosen_lmt.get('limitPrice', 0))
                 tick = INSTRUMENT_SPECS[symbol]['tick_size']
                 diff = abs(curr_lmt - target_lmt)
                 threshold = tick * 2
                 
                 if diff > threshold:
-                    logger.info(f"[{symbol}] Action: UPDATE LMT | Current: {curr_lmt} | Target: {target_lmt} | Diff: {diff:.6f} > {threshold}")
+                    logger.info(f"[{symbol}] Action: UPDATE LMT | Current: {curr_lmt} | Target: {target_lmt}")
                     place_order_safe(api, {
-                        "orderId": existing_lmt.get('order_id') or existing_lmt.get('orderId'),
+                        "orderId": chosen_lmt.get('order_id') or chosen_lmt.get('orderId'),
                         "limitPrice": target_lmt,
                         "size": size
                     }, "EDIT")
-                else:
-                    logger.info(f"[{symbol}] LMT OK (Diff {diff:.6f} within threshold)")
 
     except Exception as e:
         logger.error(f"CRITICAL ERROR in monitor loop: {e}", exc_info=True)
