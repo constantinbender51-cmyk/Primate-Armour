@@ -2,6 +2,7 @@ import time
 import os
 import json
 import logging
+from datetime import datetime, timedelta, timezone  # <--- NEW IMPORT
 from decimal import Decimal
 from kraken_futures import KrakenFuturesApi
 
@@ -212,7 +213,6 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
                 o_id = order.get('order_id') or order.get('orderId')
                 if o_id not in orders_to_keep_ids:
                     logger.info(f"[{symbol}] Action: CANCEL EXTRA ORDER {o_id} (Type: {order.get('orderType')})")
-                    # FIX: 'order_id' is acceptable for cancellation in most libs, but orderId is safer standard
                     place_order_safe(api, {
                         "order_id": o_id, 
                         "symbol": symbol
@@ -242,15 +242,16 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
                 if price_diff > (tick * 2) or size_diff > 0:
                     logger.info(f"[{symbol}] Action: UPDATE STP | PriceDiff: {price_diff:.4f} | SizeDiff: {size_diff}")
                     
-                    # FIX: Added processBefore + correct orderId casing + symbol
-                    process_before_ms = int((time.time() + 2) * 1000)
+                    # FIX: Correct ISO 8601 formatting for processBefore
+                    process_before_dt = datetime.now(timezone.utc) + timedelta(seconds=2)
+                    process_before_str = process_before_dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
                     
                     place_order_safe(api, {
-                        "orderId": chosen_stp.get('order_id') or chosen_stp.get('orderId'), # FIXED: camelCase
-                        "symbol": symbol, # FIXED: Added Symbol
+                        "orderId": chosen_stp.get('order_id') or chosen_stp.get('orderId'), # CamelCase Required
+                        "symbol": symbol, # Symbol Required
                         "stopPrice": target_stp,
                         "size": size,
-                        "processBefore": process_before_ms
+                        "processBefore": process_before_str
                     }, "EDIT")
 
             # --- EXECUTION: TAKE PROFIT ---
@@ -276,15 +277,16 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
                 if price_diff > (tick * 2) or size_diff > 0:
                     logger.info(f"[{symbol}] Action: UPDATE LMT | PriceDiff: {price_diff:.4f} | SizeDiff: {size_diff}")
                     
-                    # FIX: Added processBefore + correct orderId casing + symbol
-                    process_before_ms = int((time.time() + 2) * 1000)
+                    # FIX: Correct ISO 8601 formatting for processBefore
+                    process_before_dt = datetime.now(timezone.utc) + timedelta(seconds=2)
+                    process_before_str = process_before_dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
 
                     place_order_safe(api, {
-                        "orderId": chosen_lmt.get('order_id') or chosen_lmt.get('orderId'), # FIXED: camelCase
-                        "symbol": symbol, # FIXED: Added Symbol
+                        "orderId": chosen_lmt.get('order_id') or chosen_lmt.get('orderId'), # CamelCase Required
+                        "symbol": symbol, # Symbol Required
                         "limitPrice": target_lmt,
                         "size": size,
-                        "processBefore": process_before_ms
+                        "processBefore": process_before_str
                     }, "EDIT")
 
     except Exception as e:
