@@ -12,7 +12,7 @@ API_SECRET = os.getenv("KRAKEN_FUTURES_SECRET", "YOUR_API_SECRET")
 STOP_LOSS_PCT = 0.015  # 1.5%
 TAKE_PROFIT_PCT = 0.05 # 5.0%
 
-# Symbols to completely ignore (e.g. ['PF_XBTUSD'])
+# Symbols to completely ignore
 EXCLUDED_SYMBOLS = ["PF_XBTUSD"]
 
 # Setup Logging
@@ -77,7 +77,6 @@ def format_price(price, symbol):
     rounded = round(price / tick) * tick
     fmt_str = f"{rounded:.{decimals}f}"
     
-    # Return valid JSON number (int if 0 decimals, else float)
     val = float(fmt_str) if decimals > 0 else int(float(fmt_str))
     return val, True
 
@@ -110,6 +109,17 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
         pos_resp = api.get_open_positions()
         ord_resp = api.get_open_orders()
         
+        # --- VALIDATION: OPEN POSITIONS ---
+        if 'openPositions' not in pos_resp:
+            logger.error(f"Failed to fetch positions. Response: {pos_resp}")
+            return # Abort cycle
+        
+        # --- VALIDATION: OPEN ORDERS (CRITICAL) ---
+        # If this fails, we must NOT proceed, or we risk duplicating orders.
+        if 'openOrders' not in ord_resp:
+            logger.error(f"Failed to fetch open orders. Aborting cycle to prevent duplicates. Response: {ord_resp}")
+            return # Abort cycle
+
         positions = pos_resp.get("openPositions", [])
         open_orders = ord_resp.get("openOrders", [])
 
@@ -119,12 +129,10 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
 
         # 2. Iterate Positions
         for pos in positions:
-            symbol = pos['symbol'] # e.g. "PF_ADAUSD"
+            symbol = pos['symbol'] 
             
-            # --- Exclusion Check ---
-            # Compare upper case to be safe
+            # Exclusion Check
             if symbol.upper() in [x.upper() for x in EXCLUDED_SYMBOLS]:
-                # logger.info(f"[{symbol}] Skipping (Excluded)")
                 continue
 
             if symbol not in INSTRUMENT_SPECS:
@@ -132,11 +140,11 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
                 continue
 
             # Position Details
-            side = pos['side'].lower() # 'long'/'short' or 'buy'/'sell'
+            side = pos['side'].lower() 
             entry_price = float(pos['price'])
             raw_size = float(pos['size'])
             
-            # Determine Action Side (Close position)
+            # Determine Action Side
             if side in ['long', 'buy']:
                 action_side = 'sell'
                 raw_stp = entry_price * (1 - STOP_LOSS_PCT)
@@ -155,33 +163,28 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
                 logger.error(f"[{symbol}] Formatting failed.")
                 continue
 
-            # --- CRITICAL FIX: MATCH EXISTING ORDERS ---
+            # --- MATCH EXISTING ORDERS ---
             existing_stp = None
             existing_lmt = None
 
             for order in open_orders:
-                # 1. Normalize Symbol (Handle case mismatch)
-                o_symbol = order['symbol']
-                if o_symbol.lower() != symbol.lower():
+                # Normalize Symbol
+                if order['symbol'].lower() != symbol.lower():
                     continue
 
-                # 2. Normalize Side
-                o_side = order['side'].lower()
-                if o_side != action_side:
+                # Normalize Side
+                if order['side'].lower() != action_side:
                     continue
                 
-                # 3. Normalize Type (Handle 'stp' vs 'stop')
+                # Normalize Type
                 o_type = order['orderType'].lower()
                 
-                # Check for Stop Loss
                 if o_type in ['stp', 'stop']:
                     existing_stp = order
-                
-                # Check for Take Profit
                 elif o_type in ['lmt', 'limit']:
                     existing_lmt = order
 
-            # --- EXECUTION LOGIC ---
+            # --- EXECUTION ---
             
             # 1. STOP LOSS
             if not existing_stp:
@@ -196,11 +199,10 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
                     "triggerSignal": "mark"
                 })
             else:
-                # Check if update needed
                 curr_stp = float(existing_stp.get('stopPrice', 0))
                 tick = INSTRUMENT_SPECS[symbol]['tick_size']
                 if abs(curr_stp - target_stp) > (tick * 2):
-                    logger.info(f"[{symbol}] STP deviation detected ({curr_stp} vs {target_stp}). Updating...")
+                    logger.info(f"[{symbol}] STP deviation ({curr_stp} vs {target_stp}). Updating...")
                     api.edit_order({
                         "orderId": existing_stp['order_id'],
                         "stopPrice": target_stp,
@@ -222,7 +224,7 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
                 curr_lmt = float(existing_lmt.get('limitPrice', 0))
                 tick = INSTRUMENT_SPECS[symbol]['tick_size']
                 if abs(curr_lmt - target_lmt) > (tick * 2):
-                    logger.info(f"[{symbol}] LMT deviation detected ({curr_lmt} vs {target_lmt}). Updating...")
+                    logger.info(f"[{symbol}] LMT deviation ({curr_lmt} vs {target_lmt}). Updating...")
                     api.edit_order({
                         "orderId": existing_lmt['order_id'],
                         "limitPrice": target_lmt,
