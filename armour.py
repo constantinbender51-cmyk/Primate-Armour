@@ -212,7 +212,7 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
                 o_id = order.get('order_id') or order.get('orderId')
                 if o_id not in orders_to_keep_ids:
                     logger.info(f"[{symbol}] Action: CANCEL EXTRA ORDER {o_id} (Type: {order.get('orderType')})")
-                    # FIX: Using 'order_id' instead of 'orderId'
+                    # FIX: 'order_id' is acceptable for cancellation in most libs, but orderId is safer standard
                     place_order_safe(api, {
                         "order_id": o_id, 
                         "symbol": symbol
@@ -241,11 +241,16 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
                 # Update if Price changed significantly OR Size is wrong
                 if price_diff > (tick * 2) or size_diff > 0:
                     logger.info(f"[{symbol}] Action: UPDATE STP | PriceDiff: {price_diff:.4f} | SizeDiff: {size_diff}")
+                    
+                    # FIX: Added processBefore + correct orderId casing + symbol
+                    process_before_ms = int((time.time() + 2) * 1000)
+                    
                     place_order_safe(api, {
-                        "order_id": chosen_stp.get('order_id') or chosen_stp.get('orderId'),
-                        "symbol": symbol,       # <--- CRITICAL FIX: Added Symbol
-                        "stopPrice": target_stp, # <--- VERIFIED: stopPrice is included here
-                        "size": size 
+                        "orderId": chosen_stp.get('order_id') or chosen_stp.get('orderId'), # FIXED: camelCase
+                        "symbol": symbol, # FIXED: Added Symbol
+                        "stopPrice": target_stp,
+                        "size": size,
+                        "processBefore": process_before_ms
                     }, "EDIT")
 
             # --- EXECUTION: TAKE PROFIT ---
@@ -270,11 +275,16 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
                 # Update if Price changed significantly OR Size is wrong
                 if price_diff > (tick * 2) or size_diff > 0:
                     logger.info(f"[{symbol}] Action: UPDATE LMT | PriceDiff: {price_diff:.4f} | SizeDiff: {size_diff}")
+                    
+                    # FIX: Added processBefore + correct orderId casing + symbol
+                    process_before_ms = int((time.time() + 2) * 1000)
+
                     place_order_safe(api, {
-                        "order_id": chosen_lmt.get('order_id') or chosen_lmt.get('orderId'),
-                        "symbol": symbol,        # <--- CRITICAL FIX: Added Symbol
-                        "limitPrice": target_lmt, # <--- VERIFIED: limitPrice for LMT orders
-                        "size": size
+                        "orderId": chosen_lmt.get('order_id') or chosen_lmt.get('orderId'), # FIXED: camelCase
+                        "symbol": symbol, # FIXED: Added Symbol
+                        "limitPrice": target_lmt,
+                        "size": size,
+                        "processBefore": process_before_ms
                     }, "EDIT")
 
     except Exception as e:
