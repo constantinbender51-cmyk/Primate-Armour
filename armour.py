@@ -12,6 +12,9 @@ API_SECRET = os.getenv("KRAKEN_FUTURES_SECRET", "YOUR_API_SECRET")
 STOP_LOSS_PCT = 0.015  # 1.5%
 TAKE_PROFIT_PCT = 0.05 # 5.0%
 
+# List of symbols to IGNORE (Case-sensitive, usually uppercase)
+EXCLUDED_SYMBOLS = ["PF_XBTUSD"] 
+
 # Setup Logging
 logging.basicConfig(
     level=logging.INFO,
@@ -25,29 +28,26 @@ INSTRUMENT_SPECS = {}
 
 def get_decimals_from_tick(tick_val):
     """
-    Calculates decimal places from tick size, handling floats and strings.
+    Calculates decimal places from tick size, handling Scientific Notation (1e-05).
     """
     try:
-        # Normalize handles scientific notation (1e-05) automatically
         d = Decimal(str(tick_val)).normalize()
         exponent = d.as_tuple().exponent
-        # If exponent is -5, decimals = 5. If 0 or positive, decimals = 0.
         return abs(exponent) if exponent < 0 else 0
     except Exception as e:
         logger.error(f"Error calculating decimals for tick {tick_val}: {e}")
-        return 2 # Safe fallback
+        return 2
 
 def update_instrument_specs(api: KrakenFuturesApi):
     """
-    Fetches instruments. Returns False if failed or empty.
+    Fetches instruments. Returns False if failed.
     """
     logger.info("Fetching instrument specifications...")
     try:
         resp = api.get_instruments()
         
-        # Log the raw structure (truncated) to verify we actually got data
         if 'instruments' not in resp:
-            logger.error(f"API Response missing 'instruments' key: {resp.keys()}")
+            logger.error(f"API Response missing 'instruments' key.")
             return False
 
         instruments = resp.get('instruments', [])
@@ -60,13 +60,11 @@ def update_instrument_specs(api: KrakenFuturesApi):
             symbol = inst.get('symbol')
             if not symbol: continue
 
-            # Extract Raw Values
+            # Validation: We MUST have these values
             raw_tick = inst.get('tickSize')
             raw_prec = inst.get('contractValueTradePrecision')
             
-            # Validation: We MUST have these values
             if raw_tick is None or raw_prec is None:
-                logger.warning(f"Skipping {symbol}: Missing tickSize or precision in API data.")
                 continue
 
             tick_size = float(raw_tick)
@@ -80,10 +78,6 @@ def update_instrument_specs(api: KrakenFuturesApi):
             }
             count += 1
             
-            # Debug log for specific pairs to verify correctness
-            if symbol in ['PF_ADAUSD', 'PF_XBTUSD']:
-                logger.info(f"Loaded {symbol}: Tick={tick_size} ({price_decimals} decimals), QtyPrec={qty_prec}")
-
         logger.info(f"Successfully loaded specs for {count} instruments.")
         return True
 
@@ -92,12 +86,8 @@ def update_instrument_specs(api: KrakenFuturesApi):
         return False
 
 def format_price(price, symbol):
-    """
-    Returns (price, isValid)
-    """
     specs = INSTRUMENT_SPECS.get(symbol)
-    if not specs: 
-        return None, False
+    if not specs: return None, False
 
     tick = specs['tick_size']
     decimals = specs['price_decimals']
@@ -108,7 +98,7 @@ def format_price(price, symbol):
     # Format string to specific decimal places
     fmt_str = f"{rounded:.{decimals}f}"
     
-    # Return correct type
+    # Return correct type (int vs float)
     final_val = float(fmt_str) if decimals > 0 else int(float(fmt_str))
     
     return final_val, True
@@ -123,20 +113,14 @@ def format_qty(qty, symbol):
     return final_val, True
 
 def place_order_safe(api, payload):
-    """
-    Wrapper to send order and log full response.
-    """
     symbol = payload.get('symbol')
     logger.info(f"[{symbol}] Sending Order: {json.dumps(payload)}")
     try:
         resp = api.send_order(payload)
-        
-        # Check for API-level errors even if HTTP 200
         if resp.get('result') == 'error':
             logger.error(f"[{symbol}] API ERROR: {resp}")
         else:
             logger.info(f"[{symbol}] Success: {resp.get('sendStatus')}")
-            
     except Exception as e:
         logger.error(f"[{symbol}] EXCEPTION sending order: {e}")
 
@@ -157,11 +141,16 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
         for pos in positions:
             symbol = pos['symbol']
             
-            # --- VALIDATION GATE ---
-            if symbol not in INSTRUMENT_SPECS:
-                logger.warning(f"[{symbol}] MISSING SPECS. Cannot calculate safe prices. Skipping.")
+            # --- 1. EXCLUSION CHECK ---
+            if symbol in EXCLUDED_SYMBOLS:
+                # Log only once per loop to avoid spamming if you prefer
+                # logger.info(f"[{symbol}] Skipping (Excluded).")
                 continue
-            # -----------------------
+            
+            # --- 2. VALIDATION GATE ---
+            if symbol not in INSTRUMENT_SPECS:
+                logger.warning(f"[{symbol}] MISSING SPECS. Skipping.")
+                continue
 
             side = pos['side'].lower()
             entry_price = float(pos['price'])
@@ -171,7 +160,7 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
             size, q_ok = format_qty(raw_size, symbol)
             if not q_ok: continue
 
-            # Calculate Raw Targets
+            # Calculate Targets
             if side in ['long', 'buy']:
                 action_side = 'sell'
                 raw_stp = entry_price * (1 - STOP_LOSS_PCT)
@@ -186,7 +175,7 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
             target_lmt, l_ok = format_price(raw_lmt, symbol)
 
             if not s_ok or not l_ok:
-                logger.error(f"[{symbol}] Failed to format prices. Tick info missing?")
+                logger.error(f"[{symbol}] Failed to format prices.")
                 continue
 
             # Identify Existing Orders
@@ -254,13 +243,12 @@ if __name__ == "__main__":
 
     api = KrakenFuturesApi(API_KEY, API_SECRET)
     
-    # 1. Mandatory Instrument Load
     success = update_instrument_specs(api)
     if not success:
-        logger.critical("Failed to acquire instrument specs. Exiting to prevent errors.")
+        logger.critical("Failed to acquire instrument specs. Exiting.")
         exit(1)
 
-    logger.info("--- Risk Manager Running ---")
+    logger.info(f"--- Risk Manager Running (Excluding: {EXCLUDED_SYMBOLS}) ---")
     while True:
         monitor_and_manage_risk(api)
         time.sleep(60)
