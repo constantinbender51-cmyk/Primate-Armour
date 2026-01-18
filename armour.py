@@ -199,10 +199,7 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
 
             # --- SELECTION LOGIC ---
             # We want to keep exactly ONE best order for STP and ONE for LMT.
-            # If multiple exist, we pick the one closest to our target (to minimize edits) or just the first one.
-            # Then we cancel the rest.
-
-            # Helper to select best order (currently just picks first, but you can add logic to pick closest price)
+            # Picking the first one found as the 'primary', others will be cancelled.
             chosen_stp = existing_stp_orders[0] if existing_stp_orders else None
             chosen_lmt = existing_lmt_orders[0] if existing_lmt_orders else None
 
@@ -211,13 +208,13 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
             if chosen_lmt: orders_to_keep_ids.append(chosen_lmt.get('order_id') or chosen_lmt.get('orderId'))
 
             # --- CLEANUP: Cancel Extra Orders ---
-            # Iterate through ALL orders for this symbol/side and cancel if not in "keep" list
             for order in position_orders:
                 o_id = order.get('order_id') or order.get('orderId')
                 if o_id not in orders_to_keep_ids:
                     logger.info(f"[{symbol}] Action: CANCEL EXTRA ORDER {o_id} (Type: {order.get('orderType')})")
+                    # FIX: Using 'order_id' instead of 'orderId'
                     place_order_safe(api, {
-                        "orderId": o_id,
+                        "order_id": o_id, 
                         "symbol": symbol
                     }, "CANCEL")
 
@@ -235,14 +232,17 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
                 }, "CREATE")
             else:
                 curr_stp = float(chosen_stp.get('stopPrice', 0))
-                tick = INSTRUMENT_SPECS[symbol]['tick_size']
-                diff = abs(curr_stp - target_stp)
-                threshold = tick * 2 # Only edit if diff is > 2 ticks to save API calls
+                curr_size = float(chosen_stp.get('size', 0))
                 
-                if diff > threshold:
-                    logger.info(f"[{symbol}] Action: UPDATE STP | Current: {curr_stp} | Target: {target_stp}")
+                tick = INSTRUMENT_SPECS[symbol]['tick_size']
+                price_diff = abs(curr_stp - target_stp)
+                size_diff = abs(curr_size - size)
+                
+                # Update if Price changed significantly OR Size is wrong
+                if price_diff > (tick * 2) or size_diff > 0:
+                    logger.info(f"[{symbol}] Action: UPDATE STP | PriceDiff: {price_diff:.4f} | SizeDiff: {size_diff}")
                     place_order_safe(api, {
-                        "orderId": chosen_stp.get('order_id') or chosen_stp.get('orderId'),
+                        "order_id": chosen_stp.get('order_id') or chosen_stp.get('orderId'),
                         "stopPrice": target_stp,
                         "size": size 
                     }, "EDIT")
@@ -260,14 +260,17 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
                 }, "CREATE")
             else:
                 curr_lmt = float(chosen_lmt.get('limitPrice', 0))
+                curr_size = float(chosen_lmt.get('size', 0))
+
                 tick = INSTRUMENT_SPECS[symbol]['tick_size']
-                diff = abs(curr_lmt - target_lmt)
-                threshold = tick * 2
-                
-                if diff > threshold:
-                    logger.info(f"[{symbol}] Action: UPDATE LMT | Current: {curr_lmt} | Target: {target_lmt}")
+                price_diff = abs(curr_lmt - target_lmt)
+                size_diff = abs(curr_size - size)
+
+                # Update if Price changed significantly OR Size is wrong
+                if price_diff > (tick * 2) or size_diff > 0:
+                    logger.info(f"[{symbol}] Action: UPDATE LMT | PriceDiff: {price_diff:.4f} | SizeDiff: {size_diff}")
                     place_order_safe(api, {
-                        "orderId": chosen_lmt.get('order_id') or chosen_lmt.get('orderId'),
+                        "order_id": chosen_lmt.get('order_id') or chosen_lmt.get('orderId'),
                         "limitPrice": target_lmt,
                         "size": size
                     }, "EDIT")
