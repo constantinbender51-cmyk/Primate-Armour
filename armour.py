@@ -243,8 +243,8 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
                     logger.info(f"[{symbol}] Action: UPDATE STP | PriceDiff: {price_diff:.4f} | SizeDiff: {size_diff}")
                     place_order_safe(api, {
                         "order_id": chosen_stp.get('order_id') or chosen_stp.get('orderId'),
-                        "symbol": symbol, # <--- FIXED: ADDED SYMBOL
-                        "stopPrice": target_stp,
+                        "symbol": symbol,       # <--- CRITICAL FIX: Added Symbol
+                        "stopPrice": target_stp, # <--- VERIFIED: stopPrice is included here
                         "size": size 
                     }, "EDIT")
 
@@ -272,8 +272,8 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
                     logger.info(f"[{symbol}] Action: UPDATE LMT | PriceDiff: {price_diff:.4f} | SizeDiff: {size_diff}")
                     place_order_safe(api, {
                         "order_id": chosen_lmt.get('order_id') or chosen_lmt.get('orderId'),
-                        "symbol": symbol, # <--- FIXED: ADDED SYMBOL
-                        "limitPrice": target_lmt,
+                        "symbol": symbol,        # <--- CRITICAL FIX: Added Symbol
+                        "limitPrice": target_lmt, # <--- VERIFIED: limitPrice for LMT orders
                         "size": size
                     }, "EDIT")
 
