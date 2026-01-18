@@ -4,69 +4,96 @@ import math
 from kraken_futures import KrakenFuturesApi
 
 # --- CONFIGURATION ---
-API_KEY = os.getenv("KRAKEN_FUTURES_KEY", "YOUR_API_KEY_HERE")
-API_SECRET = os.getenv("KRAKEN_FUTURES_SECRET", "YOUR_API_SECRET_HERE")
+# ERROR NOTE: Double check your API Secret. It is usually a long string ending with '='.
+API_KEY = os.getenv("KRAKEN_FUTURES_KEY", "YOUR_ACTUAL_API_KEY")
+API_SECRET = os.getenv("KRAKEN_FUTURES_SECRET", "YOUR_ACTUAL_API_SECRET")
 
-# Target percentages
 STOP_LOSS_PCT = 0.015  # 1.5%
 TAKE_PROFIT_PCT = 0.05 # 5.0%
-
-# Threshold to trigger an update (avoid spamming API for tiny price fluctuations)
 UPDATE_THRESHOLD_PCT = 0.001 
 
-def get_precision(price):
+# Global map to store symbol -> tick_size
+INSTRUMENT_PRECISION = {}
+
+def update_instrument_precision(api: KrakenFuturesApi):
     """
-    Helper to determine precision based on price magnitude.
-    Adjust strictly according to the specific pair's tick size if needed.
+    Fetches all instruments and stores their tickSize.
+    This ensures we send prices valid for the specific contract.
     """
-    if price > 1000: return 1
-    if price > 10: return 2
-    return 4
+    try:
+        print("Fetching instrument precisions...")
+        resp = api.get_instruments()
+        
+        # Structure check: Usually resp['instruments'] is a list of dicts
+        instruments = resp.get('instruments', [])
+        
+        count = 0
+        for inst in instruments:
+            symbol = inst.get('symbol')
+            # 'tickSize' is the price increment (e.g., 0.5 for BTC, 0.0001 for XRP)
+            tick_size = inst.get('tickSize')
+            
+            if symbol and tick_size:
+                INSTRUMENT_PRECISION[symbol] = float(tick_size)
+                count += 1
+        
+        print(f"Loaded precision data for {count} instruments.")
+    except Exception as e:
+        print(f"Failed to update instruments: {e}")
+
+def round_to_tick(price, tick_size):
+    """
+    Rounds a price to the nearest valid tick size.
+    Example: Price 100.23, Tick 0.5 -> 100.0
+             Price 100.26, Tick 0.5 -> 100.5
+    """
+    if not tick_size:
+        return round(price, 2) # Fallback
+    
+    # Mathematical rounding to nearest tick
+    return round(price / tick_size) * tick_size
 
 def monitor_and_manage_risk(api: KrakenFuturesApi):
     print(f"[{time.strftime('%H:%M:%S')}] Checking positions...")
 
     try:
-        # 1. Get all data needed
-        positions_response = api.get_open_positions()
-        orders_response = api.get_open_orders()
+        # 1. Get Positions and Open Orders
+        pos_resp = api.get_open_positions()
+        ord_resp = api.get_open_orders()
         
-        # Parse response structures
-        # Note: Actual API response keys depend on result structure (usually 'openPositions' / 'openOrders')
-        positions = positions_response.get("openPositions", [])
-        open_orders = orders_response.get("openOrders", [])
+        # Handle potential API structure variations
+        positions = pos_resp.get("openPositions", [])
+        open_orders = ord_resp.get("openOrders", [])
 
         if not positions:
             print("No open positions.")
             return
 
-        # 2. Iterate through every open position
+        # 2. Iterate through positions
         for pos in positions:
             symbol = pos['symbol']
-            side = pos['side'] # 'long' or 'short' (or 'buy'/'sell' depending on API version)
+            side = pos['side'] # 'long' or 'short'
             entry_price = float(pos['price'])
             size = float(pos['size'])
             
-            # Determine direction for protective orders (Close the position)
-            # If we are Long, we need to Sell. If Short, we need to Buy.
+            # Get tick size for this symbol (default to 0.01 if missing)
+            tick_size = INSTRUMENT_PRECISION.get(symbol, 0.01)
+
+            # Determine Target Prices
             if side.lower() in ['long', 'buy']:
                 action_side = 'sell'
-                # Long: Stop is below entry, Limit is above entry
-                target_stp = entry_price * (1 - STOP_LOSS_PCT)
-                target_lmt = entry_price * (1 + TAKE_PROFIT_PCT)
+                raw_stp = entry_price * (1 - STOP_LOSS_PCT)
+                raw_lmt = entry_price * (1 + TAKE_PROFIT_PCT)
             else:
                 action_side = 'buy'
-                # Short: Stop is above entry, Limit is below entry
-                target_stp = entry_price * (1 + STOP_LOSS_PCT)
-                target_lmt = entry_price * (1 - TAKE_PROFIT_PCT)
+                raw_stp = entry_price * (1 + STOP_LOSS_PCT)
+                raw_lmt = entry_price * (1 - TAKE_PROFIT_PCT)
 
-            # Round prices to appropriate precision
-            prec = get_precision(entry_price)
-            target_stp = round(target_stp, prec)
-            target_lmt = round(target_lmt, prec)
+            # Round to Tick Size
+            target_stp = round_to_tick(raw_stp, tick_size)
+            target_lmt = round_to_tick(raw_lmt, tick_size)
 
-            # 3. Find existing orders for this specific symbol
-            # We filter for orders that are attempting to CLOSE this position (reduceOnly or opposite side)
+            # 3. Find existing orders
             existing_stp = None
             existing_lmt = None
 
@@ -74,34 +101,35 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
                 if order['symbol'] == symbol and order['side'] == action_side:
                     if order['orderType'] == 'stop':
                         existing_stp = order
-                    elif order['orderType'] == 'lmt' or order['orderType'] == 'limit':
+                    elif order['orderType'] in ['lmt', 'limit']:
                         existing_lmt = order
 
-            # 4. Manage Stop Loss (STP)
+            # 4. Manage STOP LOSS
             if not existing_stp:
-                print(f"[{symbol}] Creating MISSING Stop Loss at {target_stp}")
+                print(f"[{symbol}] Creating STP at {target_stp}")
                 api.send_order({
                     "orderType": "stop",
                     "symbol": symbol,
                     "side": action_side,
                     "size": size,
                     "stopPrice": target_stp,
-                    "reduceOnly": True, # Important: Ensures we don't flip position
-                    "triggerSignal": "mark" # Standard practice to use mark price
+                    "reduceOnly": True,
+                    "triggerSignal": "mark"
                 })
             else:
-                current_stop = float(existing_stp.get('stopPrice', 0))
-                if abs(current_stop - target_stp) / target_stp > UPDATE_THRESHOLD_PCT:
-                    print(f"[{symbol}] Updating STP: {current_stop} -> {target_stp}")
+                curr_stp = float(existing_stp.get('stopPrice', 0))
+                # Update if difference is significant
+                if abs(curr_stp - target_stp) > (tick_size * 2): # If off by more than 2 ticks
+                    print(f"[{symbol}] Updating STP: {curr_stp} -> {target_stp}")
                     api.edit_order({
                         "orderId": existing_stp['order_id'],
                         "stopPrice": target_stp,
-                        "size": size # Ensure size matches current position size
+                        "size": size
                     })
 
-            # 5. Manage Take Profit (LMT)
+            # 5. Manage TAKE PROFIT
             if not existing_lmt:
-                print(f"[{symbol}] Creating MISSING Take Profit at {target_lmt}")
+                print(f"[{symbol}] Creating LMT at {target_lmt}")
                 api.send_order({
                     "orderType": "lmt",
                     "symbol": symbol,
@@ -111,9 +139,9 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
                     "reduceOnly": True
                 })
             else:
-                current_limit = float(existing_lmt.get('limitPrice', 0))
-                if abs(current_limit - target_lmt) / target_lmt > UPDATE_THRESHOLD_PCT:
-                    print(f"[{symbol}] Updating LMT: {current_limit} -> {target_lmt}")
+                curr_lmt = float(existing_lmt.get('limitPrice', 0))
+                if abs(curr_lmt - target_lmt) > (tick_size * 2):
+                    print(f"[{symbol}] Updating LMT: {curr_lmt} -> {target_lmt}")
                     api.edit_order({
                         "orderId": existing_lmt['order_id'],
                         "limitPrice": target_lmt,
@@ -121,15 +149,17 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
                     })
 
     except Exception as e:
-        print(f"Error in monitoring loop: {e}")
+        print(f"Error in loop: {e}")
 
 if __name__ == "__main__":
     # Initialize API
+    # Ensure these keys are correct strings. No spaces, no newlines.
     api = KrakenFuturesApi(API_KEY, API_SECRET)
     
-    print("Starting Kraken Futures Risk Manager...")
-    print(f"Targets :: STP: {STOP_LOSS_PCT*100}% | LMT: {TAKE_PROFIT_PCT*100}%")
+    # 1. Fetch Tick Sizes FIRST
+    update_instrument_precision(api)
 
+    print("--- Starting Monitor ---")
     while True:
         monitor_and_manage_risk(api)
-        time.sleep(60) # Run every minute
+        time.sleep(60)
