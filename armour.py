@@ -2,7 +2,7 @@ import time
 import os
 import json
 import logging
-from datetime import datetime, timedelta, timezone  # <--- NEW IMPORT
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from kraken_futures import KrakenFuturesApi
 
@@ -92,7 +92,12 @@ def format_qty(qty, symbol):
 
 def place_order_safe(api, payload, action_type="CREATE"):
     symbol = payload.get('symbol')
-    logger.info(f"[{symbol}] >>> SENDING {action_type}: {json.dumps(payload)}")
+    # Compact log for edits to reduce noise
+    if action_type == "EDIT":
+        logger.info(f"[{symbol}] >>> EDITING Order {payload.get('orderId')}: Size={payload.get('size')} Price={payload.get('limitPrice') or payload.get('stopPrice')}")
+    else:
+        logger.info(f"[{symbol}] >>> SENDING {action_type}: {json.dumps(payload)}")
+    
     try:
         if action_type == "EDIT":
             resp = api.edit_order(payload)
@@ -146,7 +151,6 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
             
             # Exclusion
             if symbol.upper() in [x.upper() for x in EXCLUDED_SYMBOLS]:
-                logger.info(f"[{symbol}] Skipping (Excluded by config)")
                 continue
 
             if symbol not in INSTRUMENT_SPECS:
@@ -177,9 +181,6 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
                 logger.error(f"[{symbol}] Formatting Failed. Tick/Prec data likely corrupted.")
                 continue
             
-            logger.info(f"[{symbol}] Position: {side.upper()} @ {entry_price} | Size: {size}")
-            logger.info(f"[{symbol}] Targets : STP {target_stp} | LMT {target_lmt}")
-
             # --- MATCHING EXISTING ORDERS ---
             # We filter for orders strictly related to this position (Symbol + ReduceOnly/Exit Side)
             position_orders = [
@@ -200,7 +201,6 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
 
             # --- SELECTION LOGIC ---
             # We want to keep exactly ONE best order for STP and ONE for LMT.
-            # Picking the first one found as the 'primary', others will be cancelled.
             chosen_stp = existing_stp_orders[0] if existing_stp_orders else None
             chosen_lmt = existing_lmt_orders[0] if existing_lmt_orders else None
 
@@ -212,7 +212,7 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
             for order in position_orders:
                 o_id = order.get('order_id') or order.get('orderId')
                 if o_id not in orders_to_keep_ids:
-                    logger.info(f"[{symbol}] Action: CANCEL EXTRA ORDER {o_id} (Type: {order.get('orderType')})")
+                    logger.info(f"[{symbol}] Action: CANCEL EXTRA ORDER {o_id}")
                     place_order_safe(api, {
                         "order_id": o_id, 
                         "symbol": symbol
@@ -220,7 +220,7 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
 
             # --- EXECUTION: STOP LOSS ---
             if not chosen_stp:
-                logger.info(f"[{symbol}] Action: CREATE STP")
+                logger.info(f"[{symbol}] Action: CREATE STP @ {target_stp} (Size: {size})")
                 place_order_safe(api, {
                     "orderType": "stp",
                     "symbol": symbol,
@@ -235,28 +235,27 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
                 curr_size = float(chosen_stp.get('size', 0))
                 
                 tick = INSTRUMENT_SPECS[symbol]['tick_size']
+                qty_prec = INSTRUMENT_SPECS[symbol]['qty_precision']
+                
+                # Check for meaningful differences (ignore floating point dust)
                 price_diff = abs(curr_stp - target_stp)
                 size_diff = abs(curr_size - size)
                 
-                # Update if Price changed significantly OR Size is wrong
-                if price_diff > (tick * 2) or size_diff > 0:
-                    logger.info(f"[{symbol}] Action: UPDATE STP | PriceDiff: {price_diff:.4f} | SizeDiff: {size_diff}")
-                    
-                    # FIX: Correct ISO 8601 formatting for processBefore
-                    process_before_dt = datetime.now(timezone.utc) + timedelta(seconds=2)
-                    process_before_str = process_before_dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
-                    
+                # Allow for very small float errors in size comparison
+                size_epsilon = 1 / (10 ** (qty_prec + 1))
+
+                # Update if Price changed > 1 tick OR Size is wrong
+                if price_diff > (tick * 1.01) or size_diff > size_epsilon:
                     place_order_safe(api, {
-                        "orderId": chosen_stp.get('order_id') or chosen_stp.get('orderId'), # CamelCase Required
-                        "symbol": symbol, # Symbol Required
+                        "orderId": chosen_stp.get('order_id') or chosen_stp.get('orderId'),
+                        "symbol": symbol,
                         "stopPrice": target_stp,
-                        "size": size,
-                        "processBefore": process_before_str
+                        "size": size
                     }, "EDIT")
 
             # --- EXECUTION: TAKE PROFIT ---
             if not chosen_lmt:
-                logger.info(f"[{symbol}] Action: CREATE LMT")
+                logger.info(f"[{symbol}] Action: CREATE LMT @ {target_lmt} (Size: {size})")
                 place_order_safe(api, {
                     "orderType": "lmt",
                     "symbol": symbol,
@@ -270,23 +269,20 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
                 curr_size = float(chosen_lmt.get('size', 0))
 
                 tick = INSTRUMENT_SPECS[symbol]['tick_size']
+                qty_prec = INSTRUMENT_SPECS[symbol]['qty_precision']
+
                 price_diff = abs(curr_lmt - target_lmt)
                 size_diff = abs(curr_size - size)
+                
+                size_epsilon = 1 / (10 ** (qty_prec + 1))
 
-                # Update if Price changed significantly OR Size is wrong
-                if price_diff > (tick * 2) or size_diff > 0:
-                    logger.info(f"[{symbol}] Action: UPDATE LMT | PriceDiff: {price_diff:.4f} | SizeDiff: {size_diff}")
-                    
-                    # FIX: Correct ISO 8601 formatting for processBefore
-                    process_before_dt = datetime.now(timezone.utc) + timedelta(seconds=2)
-                    process_before_str = process_before_dt.strftime('%Y-%m-%dT%H:%M:%S.%fZ')
-
+                # Update if Price changed > 1 tick OR Size is wrong
+                if price_diff > (tick * 1.01) or size_diff > size_epsilon:
                     place_order_safe(api, {
-                        "orderId": chosen_lmt.get('order_id') or chosen_lmt.get('orderId'), # CamelCase Required
-                        "symbol": symbol, # Symbol Required
+                        "orderId": chosen_lmt.get('order_id') or chosen_lmt.get('orderId'),
+                        "symbol": symbol,
                         "limitPrice": target_lmt,
-                        "size": size,
-                        "processBefore": process_before_str
+                        "size": size
                     }, "EDIT")
 
     except Exception as e:
@@ -306,4 +302,4 @@ if __name__ == "__main__":
     logger.info(f"--- Running Risk Manager (Excluded: {EXCLUDED_SYMBOLS}) ---")
     while True:
         monitor_and_manage_risk(api)
-        time.sleep(60)
+        time.sleep(60) # Runs every minute
