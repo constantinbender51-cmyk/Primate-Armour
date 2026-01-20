@@ -2,6 +2,7 @@ import time
 import os
 import json
 import logging
+import requests
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from kraken_futures import KrakenFuturesApi
@@ -12,6 +13,7 @@ API_SECRET = os.getenv("KRAKEN_FUTURES_SECRET", "YOUR_API_SECRET")
 
 STOP_LOSS_PCT = 0.015  # 1.5%
 TAKE_PROFIT_PCT = 0.05 # 5.0%
+WARNING_THRESHOLD_PCT = 0.005 # 0.5% - Warning threshold
 
 # Symbols to ignore completely (no new orders, no cancels)
 EXCLUDED_SYMBOLS = ["PF_XBTUSD"]
@@ -26,6 +28,8 @@ logger = logging.getLogger()
 
 # Global Registry
 INSTRUMENT_SPECS = {}
+# Track warning state to avoid spamming: {symbol: boolean}
+WARNING_SENT_STATE = {}
 
 def get_decimals_from_tick(tick_val):
     try:
@@ -90,6 +94,21 @@ def format_qty(qty, symbol):
     val = float(fmt_str) if prec > 0 else int(float(fmt_str))
     return val, True
 
+def send_ntfy_warning(symbol, current_price, stop_price):
+    try:
+        message = f"Warning: {symbol} Price {current_price} is within 0.5% of Stop Loss {stop_price}"
+        requests.post("https://ntfy.sh/armour_stop_warning",
+            data=message.encode(encoding='utf-8'),
+            headers={
+                "Title": f"Stop Loss Warning: {symbol}",
+                "Priority": "high",
+                "Tags": "warning,skull"
+            }
+        )
+        logger.info(f"[{symbol}] Sent ntfy warning: {message}")
+    except Exception as e:
+        logger.error(f"[{symbol}] Failed to send ntfy warning: {e}")
+
 def place_order_safe(api, payload, action_type="CREATE"):
     symbol = payload.get('symbol')
     # Compact log for edits to reduce noise
@@ -126,6 +145,7 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
         # 1. Fetch Data
         pos_resp = api.get_open_positions()
         ord_resp = api.get_open_orders()
+        tickers_resp = api.get_tickers()
         
         # VALIDATION
         if 'openPositions' not in pos_resp:
@@ -138,6 +158,7 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
 
         positions = pos_resp.get("openPositions", [])
         all_open_orders = ord_resp.get("openOrders", [])
+        tickers = {t['symbol']: t for t in tickers_resp.get('tickers', [])} if tickers_resp else {}
 
         logger.info(f"Fetched: {len(positions)} Positions | {len(all_open_orders)} Open Orders")
 
@@ -180,6 +201,34 @@ def monitor_and_manage_risk(api: KrakenFuturesApi):
             if not (q_ok and s_ok and l_ok):
                 logger.error(f"[{symbol}] Formatting Failed. Tick/Prec data likely corrupted.")
                 continue
+
+            # --- CHECK FOR STOP WARNING ---
+            current_mark = 0.0
+            if symbol in tickers:
+                current_mark = float(tickers[symbol].get('markPrice', 0))
+            
+            if current_mark > 0:
+                dist_to_stop = abs(current_mark - target_stp)
+                percent_dist = dist_to_stop / current_mark
+                
+                is_close = False
+                # For LONG: Mark Price drops near Stop Price
+                # For SHORT: Mark Price rises near Stop Price
+                if side in ['long', 'buy']:
+                    if current_mark > target_stp and percent_dist <= WARNING_THRESHOLD_PCT:
+                        is_close = True
+                else: # Short
+                    if current_mark < target_stp and percent_dist <= WARNING_THRESHOLD_PCT:
+                        is_close = True
+
+                if is_close:
+                    if not WARNING_SENT_STATE.get(symbol):
+                        send_ntfy_warning(symbol, current_mark, target_stp)
+                        WARNING_SENT_STATE[symbol] = True
+                else:
+                    # Reset warning state if we move away safely (with 20% hysteresis)
+                    if WARNING_SENT_STATE.get(symbol) and percent_dist > (WARNING_THRESHOLD_PCT * 1.2):
+                        WARNING_SENT_STATE[symbol] = False
             
             # --- MATCHING EXISTING ORDERS ---
             # We filter for orders strictly related to this position (Symbol + ReduceOnly/Exit Side)
