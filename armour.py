@@ -16,7 +16,7 @@ TAKE_PROFIT_PCT = 0.05 # 3.0%
 WARNING_THRESHOLD_PCT = 0.005 # 0.5% - Warning threshold
 
 # Symbols to ignore completely (no new orders, no cancels)
-EXCLUDED_SYMBOLS = ["PF_XBTUSD", "ff_ethusd260130"]
+EXCLUDED_SYMBOLS = ["PF_XBTUSD", "FF_ETHUSD260130"]
 
 # --- LOGGING SETUP ---
 logging.basicConfig(
