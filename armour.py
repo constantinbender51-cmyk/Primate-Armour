@@ -12,7 +12,7 @@ API_KEY = os.getenv("KRAKEN_FUTURES_KEY", "YOUR_API_KEY")
 API_SECRET = os.getenv("KRAKEN_FUTURES_SECRET", "YOUR_API_SECRET")
 
 STOP_LOSS_PCT = 0.015  # 1.5%
-TAKE_PROFIT_PCT = 0.05 # 5.0%
+TAKE_PROFIT_PCT = 0.05 # 3.0%
 WARNING_THRESHOLD_PCT = 0.005 # 0.5% - Warning threshold
 
 # Symbols to ignore completely (no new orders, no cancels)
